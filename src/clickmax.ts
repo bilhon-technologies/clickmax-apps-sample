@@ -32,7 +32,7 @@ export function clientFor(config: Config, installation: Installation): Clickmax 
 
 /**
  * Reacts to a failed call. When Clickmax no longer accepts the installation (an admin removed the
- * app in "Apps instalados", or the app went back to private), the token request fails with
+ * app in Installed apps, or the app went back to private), the token request fails with
  * `invalid_grant` and the app has nothing left to retry: it marks the workspace as disconnected
  * and drops the client until someone installs again.
  *
@@ -48,7 +48,7 @@ export function handleApiError(installation: Installation, error: ClickmaxError)
   }
   if (error.type === 'permission') {
     // Permissions the workspace has not granted yet stay pending until an admin approves them.
-    return 'The installation lacks a permission this call needs. An admin can approve pending permissions in "Apps instalados".'
+    return 'The installation lacks a permission this call needs. An admin can approve pending permissions in Installed apps.'
   }
   return error.message
 }

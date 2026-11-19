@@ -98,7 +98,15 @@ export async function finishInstall(
   }
 
   const { workspaceId, installationId, idToken } = result.value
-  const installation = saveInstallation({ workspaceId, installationId, installedBy: emailFromIdToken(idToken) })
+  // The code exchange is authenticated with the client secret and bound to this browser by
+  // `state`, so here the installation can be tied to whoever started the install.
+  const installation = saveInstallation({
+    workspaceId,
+    workspaceName: undefined,
+    installationId,
+    source: 'oauth',
+    installedBy: emailFromIdToken(idToken),
+  })
   return { ok: true, installation }
 }
 

@@ -3,8 +3,9 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { clientFor, handleApiError } from './clickmax.ts'
 import { loadConfig } from './config.ts'
 import { escapeHtml, json, page } from './html.ts'
+import { discoverInstallations, handleSetup, SETUP_PATH } from './install-clickmax.ts'
 import { finishInstall, type PendingInstall, startInstall } from './install-oauth.ts'
-import { getInstallation, listInstallations } from './installations.ts'
+import { storedInstallation, storedInstallations } from './installations.ts'
 
 const config = loadConfig(process.env)
 
@@ -29,10 +30,11 @@ function send(res: ServerResponse, status: number, html: string): void {
 
 /** Home page: the install button and the workspaces this app knows about. */
 function home(): string {
-  const rows = listInstallations()
+  const rows = storedInstallations()
     .map(
       (item) => `<tr>
-  <td><a href="/workspaces/${encodeURIComponent(item.workspaceId)}">${escapeHtml(item.workspaceId)}</a></td>
+  <td><a href="/workspaces/${encodeURIComponent(item.workspaceId)}">${escapeHtml(item.workspaceName ?? item.workspaceId)}</a></td>
+  <td>${item.source === 'oauth' ? 'Connect button' : 'From Clickmax'}</td>
   <td>${escapeHtml(item.installedBy ?? '')}</td>
   <td>${item.installedAt.toISOString()}</td>
   <td>${item.removedAt ? `Removed (${item.removedAt.toISOString()})` : 'Active'}</td>
@@ -41,10 +43,44 @@ function home(): string {
     .join('')
   return page(
     'Home',
-    `<p><a class="button" href="/install">Connect with Clickmax</a></p>
+    `<p><a class="button" href="/install">Connect with Clickmax</a> <a href="/installations">Installations on Clickmax</a></p>
 <h2>Workspaces</h2>
-${rows ? `<table><tr><th>Workspace</th><th>Installed by</th><th>Installed at</th><th>Status</th></tr>${rows}</table>` : '<p>No workspace has installed the app yet.</p>'}`,
+${rows ? `<table><tr><th>Workspace</th><th>Installed through</th><th>Installed by</th><th>Installed at</th><th>Status</th></tr>${rows}</table>` : '<p>No workspace has installed the app yet.</p>'}`,
   )
+}
+
+/** One page of the app's installation list, read from Clickmax and stored as it goes. */
+async function installationsPage(pageNumber: number): Promise<[number, string]> {
+  const result = await discoverInstallations(config, pageNumber)
+  if (!result.ok) {
+    return [502, page('Installations', `<p class="error">Could not list installations: ${escapeHtml(result.error.code)} (${escapeHtml(result.error.message)})</p>`)]
+  }
+  const { data, meta } = result.value
+  const rows = data
+    .map(
+      (item) => `<tr>
+  <td><a href="/workspaces/${encodeURIComponent(item.workspace.id)}">${escapeHtml(item.workspace.name)}</a></td>
+  <td><code>${escapeHtml(item.id)}</code></td>
+  <td>${item.grantedCapabilities.length}</td>
+  <td>${item.pendingCapabilities.length}</td>
+  <td>${item.suspended ? 'Suspended (app is private)' : 'Active'}</td>
+  <td>${escapeHtml(item.createdAt)}</td>
+</tr>`,
+    )
+    .join('')
+  const pager = [
+    pageNumber > 1 ? `<a href="/installations?page=${pageNumber - 1}">Previous</a>` : '',
+    pageNumber < meta.countPages ? `<a href="/installations?page=${pageNumber + 1}">Next</a>` : '',
+  ].join(' ')
+  return [
+    200,
+    page(
+      'Installations',
+      `<p>${meta.countItens} installations, page ${pageNumber} of ${Math.max(meta.countPages, 1)}. Removed installations are not listed.</p>
+${rows ? `<table><tr><th>Workspace</th><th>Installation</th><th>Granted</th><th>Pending</th><th>Status</th><th>Installed at</th></tr>${rows}</table>` : '<p>No installations on this page.</p>'}
+<p>${pager}</p>`,
+    ),
+  ]
 }
 
 /** Example calls the workspace page offers. */
@@ -58,7 +94,7 @@ const CALLS = {
 
 /** Workspace page; runs one example call when `action` names one. */
 async function workspace(workspaceId: string, action: string | undefined): Promise<[number, string]> {
-  const installation = getInstallation(workspaceId)
+  const installation = storedInstallation(workspaceId)
   if (!installation) return [404, page('Not found', '<p class="error">This workspace has not installed the app.</p>')]
 
   let outcome = ''
@@ -115,6 +151,30 @@ const server = createServer(async (req, res) => {
       return res.end()
     }
 
+    if (req.method === 'GET' && url.pathname === SETUP_PATH) {
+      // No `sessionId` here on purpose: see `handleSetup` for why this request must not be tied
+      // to whoever is signed in to the app in this browser.
+      const result = await handleSetup(config, url.searchParams)
+      if (!result.ok) return send(res, result.status, page('Setup failed', `<p class="error">${escapeHtml(result.message)}</p>`))
+      const { installation, updated } = result
+      const name = escapeHtml(installation.workspaceName ?? installation.workspaceId)
+      return send(
+        res,
+        200,
+        page(
+          updated ? 'Permissions updated' : 'Installed',
+          `<div class="ok">${updated ? `The permissions of the app in ${name} were updated.` : `The app is installed in ${name}.`}</div>
+<p><a class="button" href="/workspaces/${encodeURIComponent(installation.workspaceId)}">Open workspace</a></p>`,
+        ),
+      )
+    }
+
+    if (req.method === 'GET' && url.pathname === '/installations') {
+      const pageNumber = Number(url.searchParams.get('page') ?? '1')
+      const [status, html] = await installationsPage(Number.isSafeInteger(pageNumber) && pageNumber > 0 ? pageNumber : 1)
+      return send(res, status, html)
+    }
+
     const match = /^\/workspaces\/([^/]+)(?:\/(\w+))?$/.exec(url.pathname)
     if (match?.[1] && (req.method === 'GET' || req.method === 'POST')) {
       const action = req.method === 'POST' ? match[2] : undefined
@@ -129,7 +189,28 @@ const server = createServer(async (req, res) => {
   }
 })
 
+/**
+ * Reads every page of the installation list once at startup. The store here lives in memory, so
+ * this brings back the workspaces after a restart; a real app would run it periodically to catch
+ * installs whose Setup URL visit never happened.
+ */
+async function syncInstallations(): Promise<void> {
+  for (let pageNumber = 1; ; pageNumber++) {
+    const result = await discoverInstallations(config, pageNumber)
+    if (!result.ok) {
+      console.error(`Installation list failed: ${result.error.code} (${result.error.message})`)
+      return
+    }
+    if (pageNumber >= result.value.meta.countPages) {
+      console.log(`Installations on Clickmax: ${result.value.meta.countItens}`)
+      return
+    }
+  }
+}
+
 server.listen(config.port, '127.0.0.1', () => {
   console.log(`Listening on http://127.0.0.1:${config.port}`)
   console.log(`Redirect URL: ${config.redirectUrl}`)
+  console.log(`Setup URL: http://127.0.0.1:${config.port}${SETUP_PATH}`)
+  void syncInstallations()
 })
